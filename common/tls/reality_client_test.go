@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/option"
 
@@ -73,6 +74,34 @@ func realityKeyShareIndex(hello *utls.PubClientHelloMsg, group utls.CurveID) int
 // Xray-core since v26.9.8 rejects a chrome ClientHello that lacks an
 // X25519MLKEM768 key share ahead of X25519. The session id stays sealed
 // with the standalone X25519 share.
+func TestRealityFallbackHonorsContext(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		time.Sleep(30 * time.Second)
+	}()
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		realityClientFallback(ctx, conn, "example.com", utls.HelloChrome_Auto)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reality fallback ignored context deadline")
+	}
+}
+
 func TestRealityClientHelloChromeKeepsX25519MLKEM768(t *testing.T) {
 	t.Parallel()
 	config, serverKey := newRealityHelloClient(t, "chrome")
