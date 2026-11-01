@@ -108,9 +108,15 @@ func (p *realityKeyPool) take() (*realityHelloKeys, error) {
 // while Android or Linux is suspended; the wall clock does, so an entry made
 // before a long sleep is dropped too.
 func (k *realityHelloKeys) fresh(now time.Time) bool {
-	monotonic := now.Sub(k.created)
-	wall := now.Round(0).Sub(k.created.Round(0))
-	return monotonic >= 0 && monotonic < realityKeyMaxAge && wall > -realityKeyMaxAge && wall < realityKeyMaxAge
+	return realityKeyAgeFresh(now.Sub(k.created), now.Round(0).Sub(k.created.Round(0)))
+}
+
+// realityKeyAgeFresh reports whether an entry of the given monotonic and wall
+// clock age may still be used. Any backward movement of either clock since
+// the entry was made marks it expired, however small.
+func realityKeyAgeFresh(monotonic, wall time.Duration) bool {
+	return monotonic >= 0 && monotonic < realityKeyMaxAge &&
+		wall >= 0 && wall < realityKeyMaxAge
 }
 
 func (p *realityKeyPool) refill() {

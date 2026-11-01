@@ -116,6 +116,32 @@ func TestRealityKeyPoolDropsStaleKeys(t *testing.T) {
 	require.False(t, fresh.fresh(now.Round(0).Add(realityKeyMaxAge)))
 }
 
+func TestRealityKeyAgeFreshClockRollback(t *testing.T) {
+	ok := time.Second
+	cases := []struct {
+		name            string
+		monotonic, wall time.Duration
+		want            bool
+	}{
+		{"both clocks forward", ok, ok, true},
+		{"same instant", 0, 0, true},
+		{"wall rollback under max age", ok, -time.Second, false},
+		{"wall rollback of 1ns", ok, -time.Nanosecond, false},
+		{"wall rollback over max age", ok, -2 * realityKeyMaxAge, false},
+		{"wall jump past max age (suspend)", ok, realityKeyMaxAge, false},
+		{"monotonic past max age", realityKeyMaxAge, ok, false},
+		{"monotonic backwards", -time.Second, ok, false},
+	}
+	for _, c := range cases {
+		require.Equal(t, c.want, realityKeyAgeFresh(c.monotonic, c.wall), c.name)
+	}
+	// Through fresh(): a wall-only "now" earlier than creation is expired.
+	keys, err := newRealityHelloKeys()
+	require.NoError(t, err)
+	require.False(t, keys.fresh(keys.created.Round(0).Add(-time.Second)))
+	require.False(t, keys.fresh(keys.created.Round(0).Add(-2*realityKeyMaxAge)))
+}
+
 // The private keys uTLS will use must belong to the shares on the wire, and
 // the hybrid share must carry its own X25519 key, like Chrome.
 func TestRealityPooledKeysMatchHello(t *testing.T) {
