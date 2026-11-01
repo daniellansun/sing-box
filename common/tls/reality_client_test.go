@@ -79,9 +79,15 @@ func TestRealityClientHelloChromeKeepsX25519MLKEM768(t *testing.T) {
 	assertRealitySession(t, serverKey, message, hello)
 }
 
-func TestRealityClientHelloFingerprintsOfferMLKEMBeforeX25519(t *testing.T) {
+// Fixed fingerprints are the named uTLS templates sing-box ships, as opposed
+// to random/randomized. readRealityClientHello unmarshals the ClientHello
+// record ClientHandshake writes, not the raw uTLS spec. Xray-core v26.9.8+
+// rejects that hello unless X25519MLKEM768 is present and listed before
+// X25519, so a utls template that drops the share, or a revert of the
+// insertion, fails this test.
+func TestRealityClientHelloFixedFingerprintsOfferMLKEMBeforeX25519(t *testing.T) {
 	t.Parallel()
-	for _, fingerprint := range []string{"firefox", "safari", "ios", "edge", "qq", "random"} {
+	for _, fingerprint := range []string{"chrome", "firefox", "safari", "ios", "edge", "qq"} {
 		t.Run(fingerprint, func(t *testing.T) {
 			t.Parallel()
 			config, serverKey := newRealityHelloClient(t, fingerprint)
@@ -89,6 +95,13 @@ func TestRealityClientHelloFingerprintsOfferMLKEMBeforeX25519(t *testing.T) {
 			assertRealitySession(t, serverKey, message, hello)
 		})
 	}
+}
+
+func TestRealityClientHelloRandomOffersMLKEM(t *testing.T) {
+	t.Parallel()
+	config, serverKey := newRealityHelloClient(t, "random")
+	message, hello := readRealityClientHello(t, config)
+	assertRealitySession(t, serverKey, message, hello)
 }
 
 // randomized draws the hybrid group and its key share independently.
@@ -136,12 +149,15 @@ func TestRealityClientHelloLegacyFingerprintsStayUntouched(t *testing.T) {
 func assertRealitySession(t *testing.T, serverKey *ecdh.PrivateKey, message []byte, hello *utls.PubClientHelloMsg) {
 	t.Helper()
 	curveIndex := slices.Index(hello.SupportedCurves, utls.X25519MLKEM768)
-	require.GreaterOrEqual(t, curveIndex, 0)
-	require.Less(t, curveIndex, slices.Index(hello.SupportedCurves, utls.X25519))
+	x25519Curve := slices.Index(hello.SupportedCurves, utls.X25519)
+	require.GreaterOrEqual(t, curveIndex, 0, "built ClientHello lacks X25519MLKEM768 group")
+	require.GreaterOrEqual(t, x25519Curve, 0, "built ClientHello lacks X25519 group")
+	require.Less(t, curveIndex, x25519Curve, "built ClientHello lists X25519MLKEM768 after X25519")
 	mlkemIndex := realityKeyShareIndex(hello, utls.X25519MLKEM768)
 	x25519Index := realityKeyShareIndex(hello, utls.X25519)
-	require.GreaterOrEqual(t, mlkemIndex, 0)
-	require.Less(t, mlkemIndex, x25519Index)
+	require.GreaterOrEqual(t, mlkemIndex, 0, "built ClientHello lacks X25519MLKEM768 key share")
+	require.GreaterOrEqual(t, x25519Index, 0, "built ClientHello lacks X25519 key share")
+	require.Less(t, mlkemIndex, x25519Index, "built ClientHello lists X25519MLKEM768 key share after X25519")
 	require.Len(t, hello.KeyShares[mlkemIndex].Data, mlkem.EncapsulationKeySize768+32)
 	require.Len(t, hello.KeyShares[x25519Index].Data, 32)
 
