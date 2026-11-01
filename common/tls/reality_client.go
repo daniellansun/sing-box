@@ -543,6 +543,17 @@ func realityIDBefore(ids []utls.CurveID, id, anchor utls.CurveID) bool {
 	return idAt >= 0 && anchorAt >= 0 && idAt < anchorAt
 }
 
+// realityFallbackUserAgent is the User-Agent of the fallback request to the
+// dest site. Every randomized preset sends "Randomized", the label stock
+// sing-box sends, so switching the preset to HelloRandomizedALPN does not
+// show up in the dest's request logs.
+func realityFallbackUserAgent(fingerprint utls.ClientHelloID) string {
+	if realityIsRandomized(fingerprint) {
+		return "Randomized"
+	}
+	return fingerprint.Client
+}
+
 func realityClientFallback(ctx context.Context, uConn net.Conn, serverName string, fingerprint utls.ClientHelloID) {
 	defer uConn.Close()
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -566,7 +577,7 @@ func realityClientFallback(ctx context.Context, uConn net.Conn, serverName strin
 	if err != nil {
 		return
 	}
-	request.Header.Set("User-Agent", fingerprint.Client)
+	request.Header.Set("User-Agent", realityFallbackUserAgent(fingerprint))
 	request.AddCookie(&http.Cookie{Name: "padding", Value: strings.Repeat("0", mRand.Intn(32)+30)})
 	response, err := client.Do(request)
 	if err != nil {

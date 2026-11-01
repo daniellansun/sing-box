@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"slices"
 	"strings"
 	"testing"
@@ -25,6 +26,7 @@ import (
 	"github.com/metacubex/utls/mlkem"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/hkdf"
+	"golang.org/x/net/http2"
 )
 
 func newRealityHelloClient(t *testing.T, fingerprint string) (*RealityClientConfig, *ecdh.PrivateKey) {
@@ -477,5 +479,72 @@ func TestRealityRandomizedAlwaysOffersALPN(t *testing.T) {
 			require.Equal(t, -1, realityKeyShareIndex(hello, utls.CurveP256), "spec %d", i)
 			assertRealitySession(t, serverKey, message, hello)
 		}
+	}
+}
+
+// The fallback GET goes to the real dest site, so its User-Agent must stay
+// what ce946596 sent: the uTLS ClientHelloID label, and "Randomized" for
+// randomized even though the preset is now HelloRandomizedALPN.
+func TestRealityFallbackUserAgent(t *testing.T) {
+	t.Parallel()
+	want := map[string]string{
+		"":                           "Chrome",
+		"chrome":                     "Chrome",
+		"chrome_psk":                 "Chrome",
+		"chrome_psk_shuffle":         "Chrome",
+		"chrome_padding_psk_shuffle": "Chrome",
+		"chrome_pq":                  "Chrome",
+		"chrome_pq_psk":              "Chrome",
+		"firefox":                    "Firefox",
+		"edge":                       "Edge",
+		"safari":                     "Safari",
+		"360":                        "360Browser",
+		"qq":                         "QQBrowser",
+		"ios":                        "iOS",
+		"android":                    "Android",
+		"randomized":                 "Randomized",
+	}
+	for name, ua := range want {
+		id, err := uTLSClientHelloID(name)
+		require.NoError(t, err, name)
+		require.Equal(t, ua, realityFallbackUserAgent(id), name)
+	}
+	id, err := uTLSClientHelloID("random")
+	require.NoError(t, err)
+	require.Contains(t, []string{"Chrome", "Firefox", "Edge", "Safari", "iOS"}, realityFallbackUserAgent(id))
+	for _, id := range []utls.ClientHelloID{utls.HelloRandomized, utls.HelloRandomizedALPN, utls.HelloRandomizedNoALPN} {
+		require.Equal(t, "Randomized", realityFallbackUserAgent(id), id.Client)
+	}
+
+	// The header realityClientFallback actually sends.
+	randomized, err := uTLSClientHelloID("randomized")
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		id utls.ClientHelloID
+		ua string
+	}{{randomized, "Randomized"}, {utls.HelloChrome_Auto, "Chrome"}, {utls.HelloFirefox_Auto, "Firefox"}} {
+		require.Equal(t, tc.ua, readRealityFallbackUserAgent(t, tc.id), tc.id.Client)
+	}
+}
+
+func readRealityFallbackUserAgent(t *testing.T, fingerprint utls.ClientHelloID) string {
+	t.Helper()
+	clientConn, serverConn := net.Pipe()
+	t.Cleanup(func() { _ = serverConn.Close() })
+	userAgent := make(chan string, 1)
+	go (&http2.Server{}).ServeConn(serverConn, &http2.ServeConnOpts{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			userAgent <- r.Header.Get("User-Agent")
+		}),
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	realityClientFallback(ctx, clientConn, "example.com", fingerprint)
+	select {
+	case ua := <-userAgent:
+		return ua
+	default:
+		t.Fatal("fallback request did not reach the server")
+		return ""
 	}
 }
