@@ -195,7 +195,7 @@ func FuzzRealityRandomizedHello(f *testing.F) {
 		defer client.Close()
 		defer server.Close()
 		uConn := utls.UClient(client, config.uClient.config.Clone(), config.uClient.id)
-		if err := ensureRealityX25519MLKEM(uConn); err != nil {
+		if err := ensureRealityX25519MLKEM(uConn, realityKeys); err != nil {
 			t.Fatal(err)
 		}
 		hello := uConn.HandshakeState.Hello

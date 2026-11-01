@@ -330,7 +330,7 @@ func TestRealityClientHelloLegacyFingerprintsStayUntouched(t *testing.T) {
 				_ = server.Close()
 			})
 			uConn := utls.UClient(client, config.uClient.config.Clone(), config.uClient.id)
-			require.NoError(t, ensureRealityX25519MLKEM(uConn))
+			require.NoError(t, ensureRealityX25519MLKEM(uConn, realityKeys))
 			require.Equal(t, beforeCurves, realityCurves(uConn))
 			require.Equal(t, beforeShares, realityShareGroups(uConn))
 			require.NotContains(t, realityCurves(uConn), utls.X25519MLKEM768)
@@ -385,7 +385,7 @@ func TestRealityFingerprintKeepsMLKEMPrivateKey(t *testing.T) {
 				_ = server.Close()
 			})
 			uConn := utls.UClient(client, config.uClient.config.Clone(), config.uClient.id)
-			require.NoError(t, ensureRealityX25519MLKEM(uConn))
+			require.NoError(t, ensureRealityX25519MLKEM(uConn, realityKeys))
 			keys := uConn.HandshakeState.State13.KeyShareKeys
 			require.NotNil(t, keys)
 			require.NotNil(t, keys.Ecdhe)

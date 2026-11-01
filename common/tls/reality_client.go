@@ -110,6 +110,9 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	uConfig.InsecureSkipVerify = true
 	uConfig.SessionTicketsDisabled = true
 	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate
+	if pool := realityKeyPoolFor(uConfig); pool != nil {
+		defer pool.refill()
+	}
 	var uConn *utls.UConn
 	var err error
 	if realityIsRandomized(e.uClient.id) {
@@ -118,7 +121,7 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 		uConn, err = buildRandomizedRealityConn(conn, uConfig, e.uClient.id)
 	} else {
 		uConn = utls.UClient(conn, uConfig, e.uClient.id)
-		err = ensureRealityX25519MLKEM(uConn)
+		err = ensureRealityX25519MLKEM(uConn, realityKeyPoolFor(uConfig))
 	}
 	if err != nil {
 		return nil, err
@@ -226,7 +229,10 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 // would not give the server an X25519 peer key that matches KeyShareKeys.Ecdhe,
 // and those fingerprints already fail against older Xray. They are left as-is,
 // aside from dropping an incomplete hybrid pair if one ever appears.
-func ensureRealityX25519MLKEM(uConn *utls.UConn) error {
+//
+// When pool is not nil, the X25519MLKEM768 and X25519 keys come from it
+// instead of being generated inside ApplyPreset.
+func ensureRealityX25519MLKEM(uConn *utls.UConn, pool *realityKeyPool) error {
 	spec, err := utls.UTLSIdToSpec(uConn.ClientHelloID)
 	if err != nil || !specHasX25519Anchor(&spec) {
 		if err := uConn.BuildHandshakeState(); err != nil {
@@ -240,10 +246,46 @@ func ensureRealityX25519MLKEM(uConn *utls.UConn) error {
 	// also used when the spec is unchanged (chrome): BuildHandshakeState on
 	// the original ID would build and shuffle the same spec a second time.
 	uConn.ClientHelloID = utls.HelloCustom
-	if err := uConn.ApplyPreset(&spec); err != nil {
+	if err := applyRealitySpec(uConn, &spec, pool); err != nil {
 		return err
 	}
 	return uConn.BuildHandshakeState()
+}
+
+// realityKeyPoolFor returns the shared key pool, or nil when the config
+// supplies its own randomness source, which ApplyPreset must keep using.
+func realityKeyPoolFor(config *utls.Config) *realityKeyPool {
+	if config.Rand != nil {
+		return nil
+	}
+	return realityKeys
+}
+
+// applyRealitySpec is ApplyPreset with the X25519MLKEM768 and X25519 keys
+// taken from pool when the spec's key shares allow it.
+func applyRealitySpec(uConn *utls.UConn, spec *utls.ClientHelloSpec, pool *realityKeyPool) error {
+	var shares *utls.KeyShareExtension
+	for _, extension := range spec.Extensions {
+		if ext, ok := extension.(*utls.KeyShareExtension); ok {
+			shares = ext
+		}
+	}
+	var keys *realityHelloKeys
+	if pool != nil && shares != nil && canFillRealityKeyShares(shares.KeyShares) {
+		var err error
+		keys, err = pool.take()
+		if err != nil {
+			return err
+		}
+		fillRealityKeyShares(shares.KeyShares, keys)
+	}
+	if err := uConn.ApplyPreset(spec); err != nil {
+		return err
+	}
+	if keys != nil {
+		installRealityKeys(uConn, keys)
+	}
+	return nil
 }
 
 func realityIsRandomized(id utls.ClientHelloID) bool {
@@ -282,7 +324,7 @@ func buildRandomizedRealityConn(conn net.Conn, config *utls.Config, id utls.Clie
 		Extensions:         uConn.Extensions,
 	}
 	fresh := utls.UClient(conn, config, utls.HelloCustom)
-	if err := fresh.ApplyPreset(spec); err != nil {
+	if err := applyRealitySpec(fresh, spec, realityKeyPoolFor(config)); err != nil {
 		return nil, err
 	}
 	if err := fresh.BuildHandshakeState(); err != nil {
