@@ -107,9 +107,6 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 		serverName: e.uClient.ServerName(),
 	}
 	uConfig := e.uClient.config.Clone()
-	// Applying the fingerprint copies its ALPN onto NextProtos. Keep the
-	// caller's list so it can be written back into the marshaled hello.
-	configuredALPN := append([]string(nil), uConfig.NextProtos...)
 	uConfig.InsecureSkipVerify = true
 	uConfig.SessionTicketsDisabled = true
 	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate
@@ -128,19 +125,12 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	}
 	verifier.UConn = uConn
 
-	if len(configuredALPN) > 0 {
+	if len(uConfig.NextProtos) > 0 {
 		for _, extension := range uConn.Extensions {
-			alpnExtension, isALPN := extension.(*utls.ALPNExtension)
-			if !isALPN {
-				continue
+			if alpnExtension, isALPN := extension.(*utls.ALPNExtension); isALPN {
+				alpnExtension.AlpnProtocols = uConfig.NextProtos
+				break
 			}
-			alpnExtension.AlpnProtocols = configuredALPN
-			// The hello was already marshaled. Rebuild so the configured
-			// ALPN is in Raw before the REALITY session id is sealed.
-			if err = uConn.BuildHandshakeState(); err != nil {
-				return nil, err
-			}
-			break
 		}
 	}
 
