@@ -165,6 +165,12 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
 	metadata.Destination = destination
 	var conn net.Conn
 	var baseConn net.Conn
+	var err error
+	defer func() {
+		if err != nil && conn != nil {
+			common.Close(conn)
+		}
+	}()
 	var hookOnce sync.Once
 	if h.vision {
 		ctx = vision.WithHook(ctx, func(tlsConn net.Conn) {
@@ -176,7 +182,6 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
 			})
 		})
 	}
-	var err error
 	if h.transport != nil {
 		conn, err = h.transport.DialContext(ctx)
 		if err == nil && h.vision {
@@ -203,8 +208,10 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
 
 	// Apply encryption if configured
 	if h.encryption != nil {
-		conn, err = h.encryption.Handshake(conn)
+		rawConn := conn
+		conn, err = h.encryption.Handshake(rawConn)
 		if err != nil {
+			conn = rawConn
 			return nil, E.Cause(err, "encryption handshake")
 		}
 	}
@@ -235,10 +242,12 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
 				}
 				conn = newVisionConnWrapper(conn, encConn)
 			} else {
-				return nil, E.New("Vision: failed to find encryption layer")
+				err = E.New("Vision: failed to find encryption layer")
+				return nil, err
 			}
 		} else {
-			return nil, E.New("Vision requires either TLS/Reality or Encryption")
+			err = E.New("Vision requires either TLS/Reality or Encryption")
+			return nil, err
 		}
 	}
 
@@ -248,27 +257,56 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
 		if h.vision && visionBaseConn != nil {
 			// For Vision, we need to pass the base connection (TLS or encryption layer)
 			// to prepareConn so it can properly initialize VisionConn
-			return h.client.DialEarlyConnWithOptions(conn, visionBaseConn, destination, visionCanSplice)
+			handed := conn
+			out, dialErr := h.client.DialEarlyConnWithOptions(handed, visionBaseConn, destination, visionCanSplice)
+			if dialErr != nil {
+				conn = handed
+				err = dialErr
+				return nil, dialErr
+			}
+			conn = nil
+			return out, nil
 		}
-		return h.client.DialEarlyConn(conn, destination)
+		out, dialErr := h.client.DialEarlyConn(conn, destination)
+		if dialErr != nil {
+			err = dialErr
+			return nil, dialErr
+		}
+		conn = nil
+		return out, nil
 	case N.NetworkUDP:
 		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 		if h.xudp {
-			return h.client.DialEarlyXUDPPacketConn(conn, destination)
+			out, dialErr := h.client.DialEarlyXUDPPacketConn(conn, destination)
+			if dialErr != nil {
+				err = dialErr
+				return nil, dialErr
+			}
+			conn = nil
+			return out, nil
 		} else if h.packetAddr {
 			if destination.IsFqdn() {
-				return nil, E.New("packetaddr: domain destination is not supported")
-			}
-			packetConn, err := h.client.DialEarlyPacketConn(conn, M.Socksaddr{Fqdn: packetaddr.SeqPacketMagicAddress})
-			if err != nil {
+				err = E.New("packetaddr: domain destination is not supported")
 				return nil, err
 			}
+			packetConn, dialErr := h.client.DialEarlyPacketConn(conn, M.Socksaddr{Fqdn: packetaddr.SeqPacketMagicAddress})
+			if dialErr != nil {
+				err = dialErr
+				return nil, dialErr
+			}
+			conn = nil
 			return bufio.NewBindPacketConn(packetaddr.NewConn(packetConn, destination), destination), nil
-		} else {
-			return h.client.DialEarlyPacketConn(conn, destination)
 		}
+		out, dialErr := h.client.DialEarlyPacketConn(conn, destination)
+		if dialErr != nil {
+			err = dialErr
+			return nil, dialErr
+		}
+		conn = nil
+		return out, nil
 	default:
-		return nil, E.Extend(N.ErrUnknownNetwork, network)
+		err = E.Extend(N.ErrUnknownNetwork, network)
+		return nil, err
 	}
 }
 
@@ -279,6 +317,11 @@ func (h *vlessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
 	metadata.Destination = destination
 	var conn net.Conn
 	var err error
+	defer func() {
+		if err != nil && conn != nil {
+			common.Close(conn)
+		}
+	}()
 	if h.transport != nil {
 		conn, err = h.transport.DialContext(ctx)
 	} else {
@@ -288,31 +331,45 @@ func (h *vlessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
 		}
 	}
 	if err != nil {
-		common.Close(conn)
 		return nil, err
 	}
 	// Apply encryption if configured
 	if h.encryption != nil {
-		conn, err = h.encryption.Handshake(conn)
+		rawConn := conn
+		conn, err = h.encryption.Handshake(rawConn)
 		if err != nil {
-			common.Close(conn)
+			conn = rawConn
 			return nil, E.Cause(err, "encryption handshake")
 		}
 	}
 	if h.xudp {
-		return h.client.DialEarlyXUDPPacketConn(conn, destination)
+		packetConn, dialErr := h.client.DialEarlyXUDPPacketConn(conn, destination)
+		if dialErr != nil {
+			err = dialErr
+			return nil, dialErr
+		}
+		conn = nil
+		return packetConn, nil
 	} else if h.packetAddr {
 		if destination.IsFqdn() {
-			return nil, E.New("packetaddr: domain destination is not supported")
-		}
-		conn, err := h.client.DialEarlyPacketConn(conn, M.Socksaddr{Fqdn: packetaddr.SeqPacketMagicAddress})
-		if err != nil {
+			err = E.New("packetaddr: domain destination is not supported")
 			return nil, err
 		}
-		return packetaddr.NewConn(conn, destination), nil
-	} else {
-		return h.client.DialEarlyPacketConn(conn, destination)
+		early, dialErr := h.client.DialEarlyPacketConn(conn, M.Socksaddr{Fqdn: packetaddr.SeqPacketMagicAddress})
+		if dialErr != nil {
+			err = dialErr
+			return nil, dialErr
+		}
+		conn = nil
+		return packetaddr.NewConn(early, destination), nil
 	}
+	packetConn, dialErr := h.client.DialEarlyPacketConn(conn, destination)
+	if dialErr != nil {
+		err = dialErr
+		return nil, dialErr
+	}
+	conn = nil
+	return packetConn, nil
 }
 
 type visionConnWrapper struct {
