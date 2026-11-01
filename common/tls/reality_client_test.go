@@ -17,9 +17,9 @@ import (
 	"testing"
 
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/common"
 
 	utls "github.com/metacubex/utls"
+	"github.com/metacubex/utls/mlkem"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/hkdf"
 )
@@ -68,27 +68,6 @@ func realityKeyShareIndex(hello *utls.PubClientHelloMsg, group utls.CurveID) int
 	})
 }
 
-func realitySpecHasMLKEM(config *RealityClientConfig) (curve bool, share bool) {
-	specConn, specPeer := net.Pipe()
-	defer specConn.Close()
-	defer specPeer.Close()
-	spec := utls.UClient(specConn, config.uClient.config.Clone(), config.uClient.id)
-	if err := spec.BuildHandshakeState(); err != nil {
-		return false, false
-	}
-	for _, extension := range spec.Extensions {
-		switch ext := extension.(type) {
-		case *utls.SupportedCurvesExtension:
-			curve = common.Contains(ext.Curves, utls.X25519MLKEM768)
-		case *utls.KeyShareExtension:
-			share = common.Any(ext.KeyShares, func(item utls.KeyShare) bool {
-				return item.Group == utls.X25519MLKEM768
-			})
-		}
-	}
-	return curve, share
-}
-
 // Xray-core since v26.9.8 rejects a chrome ClientHello that lacks an
 // X25519MLKEM768 key share ahead of X25519. The session id stays sealed
 // with the standalone X25519 share.
@@ -97,6 +76,65 @@ func TestRealityClientHelloChromeKeepsX25519MLKEM768(t *testing.T) {
 	config, serverKey := newRealityHelloClient(t, "chrome")
 	message, hello := readRealityClientHello(t, config)
 
+	assertRealitySession(t, serverKey, message, hello)
+}
+
+func TestRealityClientHelloFingerprintsOfferMLKEMBeforeX25519(t *testing.T) {
+	t.Parallel()
+	for _, fingerprint := range []string{"firefox", "safari", "ios", "edge", "qq", "random"} {
+		t.Run(fingerprint, func(t *testing.T) {
+			t.Parallel()
+			config, serverKey := newRealityHelloClient(t, fingerprint)
+			message, hello := readRealityClientHello(t, config)
+			assertRealitySession(t, serverKey, message, hello)
+		})
+	}
+}
+
+// randomized draws the hybrid group and its key share independently.
+// Every seed must still offer both, with the share ahead of X25519.
+func TestRealityClientHelloRandomizedAlwaysOffersMLKEM(t *testing.T) {
+	t.Parallel()
+	config, serverKey := newRealityHelloClient(t, "randomized")
+	for range 20 {
+		seed, err := utls.NewPRNGSeed()
+		require.NoError(t, err)
+		config.uClient.id.Seed = seed
+		message, hello := readRealityClientHello(t, config)
+		assertRealitySession(t, serverKey, message, hello)
+	}
+}
+
+// android and 360 have no X25519 key share and already fail on old Xray.
+// The hybrid share is not invented for them.
+func TestRealityClientHelloLegacyFingerprintsStayUntouched(t *testing.T) {
+	t.Parallel()
+	for _, fingerprint := range []string{"android", "360"} {
+		t.Run(fingerprint, func(t *testing.T) {
+			t.Parallel()
+			config, _ := newRealityHelloClient(t, fingerprint)
+			spec, err := utls.UTLSIdToSpec(config.uClient.id)
+			require.NoError(t, err)
+			beforeCurves := append([]utls.CurveID(nil), specCurves(&spec)...)
+			beforeShares := append([]utls.CurveID(nil), specShareGroups(&spec)...)
+			client, server := net.Pipe()
+			t.Cleanup(func() {
+				_ = client.Close()
+				_ = server.Close()
+			})
+			uConn := utls.UClient(client, config.uClient.config.Clone(), config.uClient.id)
+			require.NoError(t, ensureRealityX25519MLKEM(uConn))
+			require.Equal(t, beforeCurves, realityCurves(uConn))
+			require.Equal(t, beforeShares, realityShareGroups(uConn))
+			require.NotContains(t, realityCurves(uConn), utls.X25519MLKEM768)
+			require.NotContains(t, realityShareGroups(uConn), utls.X25519MLKEM768)
+			require.NotContains(t, realityShareGroups(uConn), utls.X25519)
+		})
+	}
+}
+
+func assertRealitySession(t *testing.T, serverKey *ecdh.PrivateKey, message []byte, hello *utls.PubClientHelloMsg) {
+	t.Helper()
 	curveIndex := slices.Index(hello.SupportedCurves, utls.X25519MLKEM768)
 	require.GreaterOrEqual(t, curveIndex, 0)
 	require.Less(t, curveIndex, slices.Index(hello.SupportedCurves, utls.X25519))
@@ -104,6 +142,8 @@ func TestRealityClientHelloChromeKeepsX25519MLKEM768(t *testing.T) {
 	x25519Index := realityKeyShareIndex(hello, utls.X25519)
 	require.GreaterOrEqual(t, mlkemIndex, 0)
 	require.Less(t, mlkemIndex, x25519Index)
+	require.Len(t, hello.KeyShares[mlkemIndex].Data, mlkem.EncapsulationKeySize768+32)
+	require.Len(t, hello.KeyShares[x25519Index].Data, 32)
 
 	peerKey, err := ecdh.X25519().NewPublicKey(hello.KeyShares[x25519Index].Data)
 	require.NoError(t, err)
@@ -123,28 +163,69 @@ func TestRealityClientHelloChromeKeepsX25519MLKEM768(t *testing.T) {
 	require.Equal(t, []byte{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}, plaintext[8:16])
 }
 
-// randomized selects the hybrid group and its key share independently.
-// An incomplete pair is removed; a complete pair is kept.
-func TestRealityClientHelloRandomizedKeepsPairedX25519MLKEM768(t *testing.T) {
+func TestRealityFingerprintKeepsMLKEMPrivateKey(t *testing.T) {
 	t.Parallel()
-	config, _ := newRealityHelloClient(t, "randomized")
-	var kept, stripped int
-	for range 48 {
-		seed, err := utls.NewPRNGSeed()
-		require.NoError(t, err)
-		config.uClient.id.Seed = seed
-		specCurve, specShare := realitySpecHasMLKEM(config)
-		keep := specCurve && specShare
+	for _, fingerprint := range []string{"firefox", "qq", "randomized"} {
+		t.Run(fingerprint, func(t *testing.T) {
+			t.Parallel()
+			config, _ := newRealityHelloClient(t, fingerprint)
+			client, server := net.Pipe()
+			t.Cleanup(func() {
+				_ = client.Close()
+				_ = server.Close()
+			})
+			uConn := utls.UClient(client, config.uClient.config.Clone(), config.uClient.id)
+			require.NoError(t, ensureRealityX25519MLKEM(uConn))
+			keys := uConn.HandshakeState.State13.KeyShareKeys
+			require.NotNil(t, keys)
+			require.NotNil(t, keys.Ecdhe)
+			require.NotNil(t, keys.Mlkem)
+			require.NotNil(t, keys.MlkemEcdhe)
+			require.Len(t, keys.Ecdhe.PublicKey().Bytes(), 32)
+		})
+	}
+}
 
-		_, hello := readRealityClientHello(t, config)
-		require.Equal(t, keep, common.Contains(hello.SupportedCurves, utls.X25519MLKEM768))
-		require.Equal(t, keep, realityKeyShareIndex(hello, utls.X25519MLKEM768) >= 0)
-		if keep {
-			kept++
-		} else {
-			stripped++
+func specCurves(spec *utls.ClientHelloSpec) []utls.CurveID {
+	for _, extension := range spec.Extensions {
+		if curves, ok := extension.(*utls.SupportedCurvesExtension); ok {
+			return curves.Curves
 		}
 	}
-	require.Positive(t, kept)
-	require.Positive(t, stripped)
+	return nil
+}
+
+func specShareGroups(spec *utls.ClientHelloSpec) []utls.CurveID {
+	for _, extension := range spec.Extensions {
+		if shares, ok := extension.(*utls.KeyShareExtension); ok {
+			groups := make([]utls.CurveID, len(shares.KeyShares))
+			for i, share := range shares.KeyShares {
+				groups[i] = share.Group
+			}
+			return groups
+		}
+	}
+	return nil
+}
+
+func realityCurves(uConn *utls.UConn) []utls.CurveID {
+	for _, extension := range uConn.Extensions {
+		if curves, ok := extension.(*utls.SupportedCurvesExtension); ok {
+			return curves.Curves
+		}
+	}
+	return nil
+}
+
+func realityShareGroups(uConn *utls.UConn) []utls.CurveID {
+	for _, extension := range uConn.Extensions {
+		if shares, ok := extension.(*utls.KeyShareExtension); ok {
+			groups := make([]utls.CurveID, len(shares.KeyShares))
+			for i, share := range shares.KeyShares {
+				groups[i] = share.Group
+			}
+			return groups
+		}
+	}
+	return nil
 }

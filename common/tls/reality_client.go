@@ -10,6 +10,7 @@ import (
 	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/tls"
@@ -36,6 +37,7 @@ import (
 	aTLS "github.com/sagernet/sing/common/tls"
 
 	utls "github.com/metacubex/utls"
+	utlsmlkem "github.com/metacubex/utls/mlkem"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/net/http2"
 )
@@ -111,42 +113,8 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate
 	uConn := utls.UClient(conn, uConfig, e.uClient.id)
 	verifier.UConn = uConn
-	err := uConn.BuildHandshakeState()
-	if err != nil {
+	if err := ensureRealityX25519MLKEM(uConn); err != nil {
 		return nil, err
-	}
-	var mlkemCurve, mlkemKeyShare bool
-	for _, extension := range uConn.Extensions {
-		switch ext := extension.(type) {
-		case *utls.SupportedCurvesExtension:
-			mlkemCurve = common.Contains(ext.Curves, utls.X25519MLKEM768)
-		case *utls.KeyShareExtension:
-			mlkemKeyShare = common.Any(ext.KeyShares, func(share utls.KeyShare) bool {
-				return share.Group == utls.X25519MLKEM768
-			})
-		}
-	}
-	// Xray-core since v26.9.8 requires this hybrid share ahead of X25519.
-	// Keep it only when the fingerprint sends both the group and the share.
-	// A group without a share draws a HelloRetryRequest that REALITY cannot relay.
-	// A share without its group is rejected by RFC 8446, Section 4.2.8.
-	if mlkemCurve != mlkemKeyShare {
-		for _, extension := range uConn.Extensions {
-			if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
-				ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {
-					return curveID != utls.X25519MLKEM768
-				})
-			}
-			if ks, ok := extension.(*utls.KeyShareExtension); ok {
-				ks.KeyShares = common.Filter(ks.KeyShares, func(share utls.KeyShare) bool {
-					return share.Group != utls.X25519MLKEM768
-				})
-			}
-		}
-		err = uConn.BuildHandshakeState()
-		if err != nil {
-			return nil, err
-		}
 	}
 
 	if len(uConfig.NextProtos) > 0 {
@@ -231,6 +199,286 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	}
 
 	return &realityClientConnWrapper{uConn}, nil
+}
+
+// ensureRealityX25519MLKEM makes a ClientHello acceptable to Xray-core
+// v26.9.8+, which rejects a hello that does not list an X25519MLKEM768 key
+// share before X25519.
+//
+// Fingerprints that already send both (chrome) are built unchanged. Fingerprints
+// that send an X25519 key share but no hybrid share (firefox, safari, ios,
+// edge, qq) get the group and an empty key share inserted immediately before
+// X25519, then uTLS ApplyPreset fills the private keys. GREASE stays where the
+// template put it. randomized is forced to emit the same pair from its own
+// generator so the coin flips cannot omit it.
+//
+// android and 360 have no X25519 key share. Inserting a hybrid share there
+// would not give the server an X25519 peer key that matches KeyShareKeys.Ecdhe,
+// and those fingerprints already fail against older Xray. They are left as-is,
+// aside from dropping an incomplete hybrid pair if one ever appears.
+func ensureRealityX25519MLKEM(uConn *utls.UConn) error {
+	if realityIsRandomized(uConn.ClientHelloID) {
+		forceRandomizedMLKEM(&uConn.ClientHelloID)
+		if err := uConn.BuildHandshakeState(); err != nil {
+			return err
+		}
+		return patchBuiltMLKEMShare(uConn)
+	}
+	spec, err := utls.UTLSIdToSpec(uConn.ClientHelloID)
+	if err != nil || !specHasX25519Anchor(&spec) {
+		if err := uConn.BuildHandshakeState(); err != nil {
+			return err
+		}
+		return stripUnpairedX25519MLKEM(uConn)
+	}
+	if insertMLKEMIntoSpec(&spec) {
+		// BuildHandshakeState reapplies the preset from this spec instead of
+		// the original fingerprint, so the inserted share is what gets keyed.
+		setUTLSClientHelloSpec(uConn, &spec)
+	}
+	return uConn.BuildHandshakeState()
+}
+
+func realityIsRandomized(id utls.ClientHelloID) bool {
+	switch id.Client {
+	case "Randomized", "Randomized-ALPN", "Randomized-NoALPN":
+		return true
+	default:
+		return false
+	}
+}
+
+func forceRandomizedMLKEM(id *utls.ClientHelloID) {
+	weights := utls.DefaultWeights
+	if id.Weights != nil {
+		weights = *id.Weights
+	}
+	weights.TLSVersMax_Set_VersionTLS13 = 1
+	weights.FirstKeyShare_Set_CurveP256 = 0
+	// Both coin flips below use this weight. 1 makes the hybrid curve and its
+	// key share always present. It also always appends a P256 share, which
+	// Xray ignores once it has seen X25519.
+	weights.CurveIDs_Append_X25519 = 1
+	weights.KeyShare_Append_RandomGroups = 1
+	id.Weights = &weights
+}
+
+func specHasX25519Anchor(spec *utls.ClientHelloSpec) bool {
+	var curves *utls.SupportedCurvesExtension
+	var shares *utls.KeyShareExtension
+	for _, extension := range spec.Extensions {
+		switch ext := extension.(type) {
+		case *utls.SupportedCurvesExtension:
+			curves = ext
+		case *utls.KeyShareExtension:
+			shares = ext
+		}
+	}
+	return curves != nil && shares != nil &&
+		common.Contains(curves.Curves, utls.X25519) &&
+		common.Any(shares.KeyShares, func(share utls.KeyShare) bool {
+			return share.Group == utls.X25519
+		})
+}
+
+func insertMLKEMIntoSpec(spec *utls.ClientHelloSpec) bool {
+	var curves *utls.SupportedCurvesExtension
+	var shares *utls.KeyShareExtension
+	for _, extension := range spec.Extensions {
+		switch ext := extension.(type) {
+		case *utls.SupportedCurvesExtension:
+			curves = ext
+		case *utls.KeyShareExtension:
+			shares = ext
+		}
+	}
+	if curves == nil || shares == nil {
+		return false
+	}
+	nextCurves, curvesChanged := placeCurveBefore(curves.Curves, utls.X25519MLKEM768, utls.X25519)
+	nextShares, sharesChanged := placeShareBefore(shares.KeyShares, utls.X25519MLKEM768, utls.X25519)
+	if curvesChanged {
+		curves.Curves = nextCurves
+	}
+	if sharesChanged {
+		shares.KeyShares = nextShares
+	}
+	return curvesChanged || sharesChanged
+}
+
+func patchBuiltMLKEMShare(uConn *utls.UConn) error {
+	var curves *utls.SupportedCurvesExtension
+	var shares *utls.KeyShareExtension
+	for _, extension := range uConn.Extensions {
+		switch ext := extension.(type) {
+		case *utls.SupportedCurvesExtension:
+			curves = ext
+		case *utls.KeyShareExtension:
+			shares = ext
+		}
+	}
+	if curves == nil || shares == nil ||
+		!common.Contains(curves.Curves, utls.X25519) ||
+		!common.Any(shares.KeyShares, func(share utls.KeyShare) bool {
+			return share.Group == utls.X25519
+		}) {
+		return stripUnpairedX25519MLKEM(uConn)
+	}
+	nextCurves, curvesChanged := placeCurveBefore(curves.Curves, utls.X25519MLKEM768, utls.X25519)
+	nextShares, sharesChanged := placeShareBefore(shares.KeyShares, utls.X25519MLKEM768, utls.X25519)
+	if !curvesChanged && !sharesChanged {
+		return nil
+	}
+	if curvesChanged {
+		curves.Curves = nextCurves
+	}
+	if sharesChanged {
+		shares.KeyShares = nextShares
+	}
+	if err := fillNewMLKEMShare(uConn, shares); err != nil {
+		return err
+	}
+	return uConn.BuildHandshakeState()
+}
+
+func fillNewMLKEMShare(uConn *utls.UConn, shares *utls.KeyShareExtension) error {
+	for i := range shares.KeyShares {
+		if shares.KeyShares[i].Group != utls.X25519MLKEM768 {
+			continue
+		}
+		if len(shares.KeyShares[i].Data) == utlsmlkem.EncapsulationKeySize768+32 {
+			return nil
+		}
+		dk, err := utlsmlkem.GenerateKey768()
+		if err != nil {
+			return err
+		}
+		ecdhe, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			return err
+		}
+		shares.KeyShares[i].Data = append(dk.EncapsulationKey().Bytes(), ecdhe.PublicKey().Bytes()...)
+		keys := uConn.HandshakeState.State13.KeyShareKeys
+		if keys == nil {
+			return E.New("nil KeyShareKeys")
+		}
+		keys.MlkemEcdhe = ecdhe
+		assignMLKEMKey(keys, dk)
+		return nil
+	}
+	return nil
+}
+
+func setUTLSClientHelloSpec(uConn *utls.UConn, spec *utls.ClientHelloSpec) {
+	field := reflect.ValueOf(uConn).Elem().FieldByName("clientHelloSpec")
+	*(**utls.ClientHelloSpec)(unsafe.Pointer(field.UnsafeAddr())) = spec
+}
+
+func assignMLKEMKey(keys *utls.KeySharePrivateKeys, dk *utlsmlkem.DecapsulationKey768) {
+	src := reflect.ValueOf(dk).Elem().FieldByName("key")
+	dst := reflect.ValueOf(keys).Elem().FieldByName("Mlkem")
+	*(*unsafe.Pointer)(unsafe.Pointer(dst.UnsafeAddr())) = unsafe.Pointer(src.Pointer())
+}
+
+func stripUnpairedX25519MLKEM(uConn *utls.UConn) error {
+	var mlkemCurve, mlkemKeyShare bool
+	for _, extension := range uConn.Extensions {
+		switch ext := extension.(type) {
+		case *utls.SupportedCurvesExtension:
+			mlkemCurve = common.Contains(ext.Curves, utls.X25519MLKEM768)
+		case *utls.KeyShareExtension:
+			mlkemKeyShare = common.Any(ext.KeyShares, func(share utls.KeyShare) bool {
+				return share.Group == utls.X25519MLKEM768
+			})
+		}
+	}
+	if mlkemCurve == mlkemKeyShare {
+		return nil
+	}
+	for _, extension := range uConn.Extensions {
+		if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
+			ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {
+				return curveID != utls.X25519MLKEM768
+			})
+		}
+		if ks, ok := extension.(*utls.KeyShareExtension); ok {
+			ks.KeyShares = common.Filter(ks.KeyShares, func(share utls.KeyShare) bool {
+				return share.Group != utls.X25519MLKEM768
+			})
+		}
+	}
+	return uConn.BuildHandshakeState()
+}
+
+func placeCurveBefore(curves []utls.CurveID, curve, anchor utls.CurveID) ([]utls.CurveID, bool) {
+	if realityIDBefore(curves, curve, anchor) {
+		return curves, false
+	}
+	filtered := make([]utls.CurveID, 0, len(curves))
+	for _, id := range curves {
+		if id != curve {
+			filtered = append(filtered, id)
+		}
+	}
+	anchorAt := -1
+	for i, id := range filtered {
+		if id == anchor {
+			anchorAt = i
+			break
+		}
+	}
+	if anchorAt < 0 {
+		return curves, false
+	}
+	out := make([]utls.CurveID, 0, len(filtered)+1)
+	out = append(out, filtered[:anchorAt]...)
+	out = append(out, curve)
+	out = append(out, filtered[anchorAt:]...)
+	return out, true
+}
+
+func placeShareBefore(shares []utls.KeyShare, group, anchor utls.CurveID) ([]utls.KeyShare, bool) {
+	groups := make([]utls.CurveID, len(shares))
+	for i, share := range shares {
+		groups[i] = share.Group
+	}
+	if realityIDBefore(groups, group, anchor) {
+		return shares, false
+	}
+	filtered := make([]utls.KeyShare, 0, len(shares))
+	for _, share := range shares {
+		if share.Group != group {
+			filtered = append(filtered, share)
+		}
+	}
+	anchorAt := -1
+	for i, share := range filtered {
+		if share.Group == anchor {
+			anchorAt = i
+			break
+		}
+	}
+	if anchorAt < 0 {
+		return shares, false
+	}
+	out := make([]utls.KeyShare, 0, len(filtered)+1)
+	out = append(out, filtered[:anchorAt]...)
+	out = append(out, utls.KeyShare{Group: group})
+	out = append(out, filtered[anchorAt:]...)
+	return out, true
+}
+
+func realityIDBefore(ids []utls.CurveID, id, anchor utls.CurveID) bool {
+	idAt, anchorAt := -1, -1
+	for i, item := range ids {
+		if item == id && idAt < 0 {
+			idAt = i
+		}
+		if item == anchor && anchorAt < 0 {
+			anchorAt = i
+		}
+	}
+	return idAt >= 0 && anchorAt >= 0 && idAt < anchorAt
 }
 
 func realityClientFallback(ctx context.Context, uConn net.Conn, serverName string, fingerprint utls.ClientHelloID) {
