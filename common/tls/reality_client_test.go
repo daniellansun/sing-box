@@ -384,8 +384,8 @@ func TestRealityFingerprintKeepsMLKEMPrivateKey(t *testing.T) {
 				_ = client.Close()
 				_ = server.Close()
 			})
-			uConn := utls.UClient(client, config.uClient.config.Clone(), config.uClient.id)
-			require.NoError(t, ensureRealityX25519MLKEM(uConn))
+			uConn, err := buildRealityTestConn(client, config)
+			require.NoError(t, err)
 			keys := uConn.HandshakeState.State13.KeyShareKeys
 			require.NotNil(t, keys)
 			require.NotNil(t, keys.Ecdhe)

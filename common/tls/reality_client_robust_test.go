@@ -132,15 +132,19 @@ func TestRealityParallelDials(t *testing.T) {
 func TestRealityParallelDialsDistinctHellos(t *testing.T) {
 	config, serverKey := newRealityHelloClient(t, "firefox")
 	const dials = 32
+	// Each dial has a client worker and a server-side reader, and both may
+	// send to errCh, so both are tracked before errCh is closed.
 	var wg sync.WaitGroup
-	errCh := make(chan error, dials)
+	errCh := make(chan error, 2*dials)
 	wg.Add(dials)
 	for range dials {
 		go func() {
 			defer wg.Done()
 			client, server := net.Pipe()
 			defer client.Close()
+			wg.Add(1)
 			go func() {
+				defer wg.Done()
 				defer server.Close()
 				header := make([]byte, 5)
 				if _, err := io.ReadFull(server, header); err != nil {
@@ -194,8 +198,8 @@ func FuzzRealityRandomizedHello(f *testing.F) {
 		client, server := net.Pipe()
 		defer client.Close()
 		defer server.Close()
-		uConn := utls.UClient(client, config.uClient.config.Clone(), config.uClient.id)
-		if err := ensureRealityX25519MLKEM(uConn); err != nil {
+		uConn, err := buildRealityTestConn(client, config)
+		if err != nil {
 			t.Fatal(err)
 		}
 		hello := uConn.HandshakeState.Hello
@@ -317,3 +321,18 @@ var errBadHello = errString("reality client hello invariant failed")
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// buildRealityTestConn builds the ClientHello through the same branch as
+// RealityClientConfig.ClientHandshake, so randomized fingerprints get the
+// production normalization and fresh-connection key generation.
+func buildRealityTestConn(conn net.Conn, config *RealityClientConfig) (*utls.UConn, error) {
+	uConfig := config.uClient.config.Clone()
+	if realityIsRandomized(config.uClient.id) {
+		return buildRandomizedRealityConn(conn, uConfig, config.uClient.id)
+	}
+	uConn := utls.UClient(conn, uConfig, config.uClient.id)
+	if err := ensureRealityX25519MLKEM(uConn); err != nil {
+		return nil, err
+	}
+	return uConn, nil
+}
