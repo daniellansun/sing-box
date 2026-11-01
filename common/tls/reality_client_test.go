@@ -102,6 +102,31 @@ func TestRealityFallbackHonorsContext(t *testing.T) {
 	}
 }
 
+func TestRealityConfiguredALPNIsOnTheWire(t *testing.T) {
+	serverKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	config, err := NewRealityClient(context.Background(), "example.com", option.OutboundTLSOptions{
+		Enabled:    true,
+		ServerName: "example.com",
+		ALPN:       []string{"h2-reality-test"},
+		UTLS:       &option.OutboundUTLSOptions{Enabled: true, Fingerprint: "chrome"},
+		Reality: &option.OutboundRealityOptions{
+			Enabled:   true,
+			PublicKey: base64.RawURLEncoding.EncodeToString(serverKey.PublicKey().Bytes()),
+			ShortID:   "0123456789abcdef",
+		},
+	})
+	require.NoError(t, err)
+	_, hello := readRealityClientHello(t, config)
+	require.Equal(t, []string{"h2-reality-test"}, hello.AlpnProtocols)
+	mlkemAt := realityKeyShareIndex(hello, utls.X25519MLKEM768)
+	x25519At := realityKeyShareIndex(hello, utls.X25519)
+	require.GreaterOrEqual(t, mlkemAt, 0)
+	require.Less(t, mlkemAt, x25519At)
+	require.NotEmpty(t, hello.KeyShares[mlkemAt].Data)
+	require.NotEmpty(t, hello.KeyShares[x25519At].Data)
+}
+
 func TestRealityClientHelloChromeKeepsX25519MLKEM768(t *testing.T) {
 	t.Parallel()
 	config, serverKey := newRealityHelloClient(t, "chrome")
