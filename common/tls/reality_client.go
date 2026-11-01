@@ -234,11 +234,11 @@ func ensureRealityX25519MLKEM(uConn *utls.UConn) error {
 		}
 		return stripUnpairedX25519MLKEM(uConn)
 	}
-	if !insertMLKEMIntoSpec(&spec) {
-		return uConn.BuildHandshakeState()
-	}
+	insertMLKEMIntoSpec(&spec)
 	// HelloCustom + ApplyPreset is the supported way to send a modified spec.
-	// ApplyPreset generates the X25519 and X25519MLKEM768 private keys.
+	// ApplyPreset generates the X25519 and X25519MLKEM768 private keys. It is
+	// also used when the spec is unchanged (chrome): BuildHandshakeState on
+	// the original ID would build and shuffle the same spec a second time.
 	uConn.ClientHelloID = utls.HelloCustom
 	if err := uConn.ApplyPreset(&spec); err != nil {
 		return err
