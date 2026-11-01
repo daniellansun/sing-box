@@ -243,7 +243,13 @@ func init() {
 	weights := utls.DefaultWeights
 	weights.TLSVersMax_Set_VersionTLS13 = 1
 	weights.FirstKeyShare_Set_CurveP256 = 0
-	randomizedFingerprint = utls.HelloRandomized
+	// HelloRandomized leaves ALPN out with probability 0.3, decided once per
+	// process. No browser omits ALPN, so such hellos stand out, and Xray
+	// REALITY v26.10.21+ fails every handshake from them when the dest's
+	// EncryptedExtensions carry no SNI ack (www.google.com, Go 1.24 servers).
+	// HelloRandomizedALPN randomizes everything else the same way but always
+	// sends ALPN: the configured protocols, or h2 and http/1.1.
+	randomizedFingerprint = utls.HelloRandomizedALPN
 	randomizedFingerprint.Seed, _ = utls.NewPRNGSeed()
 	randomizedFingerprint.Weights = &weights
 }

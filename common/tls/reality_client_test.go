@@ -439,3 +439,43 @@ func realityShareGroups(uConn *utls.UConn) []utls.CurveID {
 	}
 	return nil
 }
+
+// uTLS HelloRandomized leaves ALPN out of ~30% of specs. Xray REALITY
+// v26.10.21+ then fails every handshake when the dest sends no SNI ack, and
+// no browser omits ALPN, so randomized must always offer it.
+func TestRealityRandomizedAlwaysOffersALPN(t *testing.T) {
+	t.Parallel()
+	for _, alpn := range [][]string{nil, {"http/1.1"}} {
+		serverKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+		require.NoError(t, err)
+		config, err := NewRealityClient(context.Background(), "example.com", option.OutboundTLSOptions{
+			Enabled:    true,
+			ServerName: "example.com",
+			ALPN:       alpn,
+			UTLS:       &option.OutboundUTLSOptions{Enabled: true, Fingerprint: "randomized"},
+			Reality: &option.OutboundRealityOptions{
+				Enabled:   true,
+				PublicKey: base64.RawURLEncoding.EncodeToString(serverKey.PublicKey().Bytes()),
+				ShortID:   "0123456789abcdef",
+			},
+		})
+		require.NoError(t, err)
+		want := alpn
+		if want == nil {
+			want = []string{"h2", "http/1.1"}
+		}
+		n := 2000
+		if alpn != nil {
+			n = 200
+		}
+		for i := 0; i < n; i++ {
+			seed, err := utls.NewPRNGSeed()
+			require.NoError(t, err)
+			config.uClient.id.Seed = seed
+			message, hello := readRealityClientHello(t, config)
+			require.Equal(t, want, hello.AlpnProtocols, "spec %d", i)
+			require.Equal(t, -1, realityKeyShareIndex(hello, utls.CurveP256), "spec %d", i)
+			assertRealitySession(t, serverKey, message, hello)
+		}
+	}
+}
