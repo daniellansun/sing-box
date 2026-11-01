@@ -78,11 +78,17 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	}, nil
 }
 
-func (c *Client) dialContext(ctx context.Context, requestURL *url.URL, headers http.Header) (*WebsocketConn, error) {
-	conn, err := c.dialer.DialContext(ctx, N.NetworkTCP, c.serverAddr)
+func (c *Client) dialContext(ctx context.Context, requestURL *url.URL, headers http.Header) (_ *WebsocketConn, err error) {
+	var conn net.Conn
+	conn, err = c.dialer.DialContext(ctx, N.NetworkTCP, c.serverAddr)
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if err != nil && conn != nil {
+			conn.Close()
+		}
+	}()
 	if c.tlsConfig != nil {
 		conn, err = tls.ClientHandshake(ctx, conn, c.tlsConfig)
 		if err != nil {
