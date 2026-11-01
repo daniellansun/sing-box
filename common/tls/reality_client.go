@@ -36,6 +36,7 @@ import (
 	aTLS "github.com/sagernet/sing/common/tls"
 
 	utls "github.com/metacubex/utls"
+	utlsmlkem "github.com/metacubex/utls/mlkem"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/net/http2"
 )
@@ -109,11 +110,20 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	uConfig.InsecureSkipVerify = true
 	uConfig.SessionTicketsDisabled = true
 	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate
-	uConn := utls.UClient(conn, uConfig, e.uClient.id)
-	verifier.UConn = uConn
-	if err := ensureRealityX25519MLKEM(uConn); err != nil {
+	var uConn *utls.UConn
+	var err error
+	if realityIsRandomized(e.uClient.id) {
+		// Normal uTLS randomization, then a per-connection edit. The shared
+		// Weights value is only read.
+		uConn, err = buildRandomizedRealityConn(conn, uConfig, e.uClient.id)
+	} else {
+		uConn = utls.UClient(conn, uConfig, e.uClient.id)
+		err = ensureRealityX25519MLKEM(uConn)
+	}
+	if err != nil {
 		return nil, err
 	}
+	verifier.UConn = uConn
 
 	if len(uConfig.NextProtos) > 0 {
 		for _, extension := range uConn.Extensions {
@@ -207,21 +217,14 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 // that send an X25519 key share but no hybrid share (firefox, safari, ios,
 // edge, qq) get the group and an empty key share inserted immediately before
 // X25519, then uTLS ApplyPreset fills the private keys. GREASE stays where the
-// template put it. randomized is forced to emit the same pair from its own
-// generator so the coin flips cannot omit it.
+// template put it. A secp256r1 key share is kept when the template sends one
+// (Firefox 120). randomized is handled separately and does not keep that share.
 //
 // android and 360 have no X25519 key share. Inserting a hybrid share there
 // would not give the server an X25519 peer key that matches KeyShareKeys.Ecdhe,
 // and those fingerprints already fail against older Xray. They are left as-is,
 // aside from dropping an incomplete hybrid pair if one ever appears.
 func ensureRealityX25519MLKEM(uConn *utls.UConn) error {
-	if realityIsRandomized(uConn.ClientHelloID) {
-		// Weights and Seed are public. Forcing these two weights makes
-		// generateRandomizedSpec emit the hybrid group and its key share.
-		// uTLS then fills the private keys itself during BuildHandshakeState.
-		forceRandomizedMLKEM(&uConn.ClientHelloID)
-		return uConn.BuildHandshakeState()
-	}
 	spec, err := utls.UTLSIdToSpec(uConn.ClientHelloID)
 	if err != nil || !specHasX25519Anchor(&spec) {
 		if err := uConn.BuildHandshakeState(); err != nil {
@@ -250,19 +253,106 @@ func realityIsRandomized(id utls.ClientHelloID) bool {
 	}
 }
 
-func forceRandomizedMLKEM(id *utls.ClientHelloID) {
-	weights := utls.DefaultWeights
-	if id.Weights != nil {
-		weights = *id.Weights
+// buildRandomizedRealityConn lets uTLS randomize with the caller's weights,
+// then rewrites only this connection's hello. supported_groups keeps every
+// group the randomizer chose, including P256. key_share is X25519MLKEM768
+// immediately before X25519, plus any GREASE share. A secp256r1 key share is
+// removed; that group stays in supported_groups only.
+func buildRandomizedRealityConn(conn net.Conn, config *utls.Config, id utls.ClientHelloID) (*utls.UConn, error) {
+	uConn := utls.UClient(conn, config, id)
+	if err := uConn.BuildHandshakeState(); err != nil {
+		return nil, err
 	}
-	weights.TLSVersMax_Set_VersionTLS13 = 1
-	weights.FirstKeyShare_Set_CurveP256 = 0
-	// Both coin flips below use this weight. 1 makes the hybrid curve and its
-	// key share always present. It also always appends a P256 share, which
-	// Xray ignores once it has seen X25519.
-	weights.CurveIDs_Append_X25519 = 1
-	weights.KeyShare_Append_RandomGroups = 1
-	id.Weights = &weights
+	needKey, err := normalizeBuiltRandomizedHello(uConn)
+	if err != nil {
+		return nil, err
+	}
+	if !needKey {
+		if err := uConn.BuildHandshakeState(); err != nil {
+			return nil, err
+		}
+		return uConn, nil
+	}
+	clearNonGREASEKeyShareData(uConn)
+	spec := &utls.ClientHelloSpec{
+		CipherSuites:       append([]uint16(nil), uConn.HandshakeState.Hello.CipherSuites...),
+		CompressionMethods: append([]byte(nil), uConn.HandshakeState.Hello.CompressionMethods...),
+		Extensions:         uConn.Extensions,
+	}
+	fresh := utls.UClient(conn, config, utls.HelloCustom)
+	if err := fresh.ApplyPreset(spec); err != nil {
+		return nil, err
+	}
+	if err := fresh.BuildHandshakeState(); err != nil {
+		return nil, err
+	}
+	return fresh, nil
+}
+
+// normalizeBuiltRandomizedHello returns true when the MLKEM share has no
+// private key yet and ApplyPreset must generate one.
+func normalizeBuiltRandomizedHello(uConn *utls.UConn) (bool, error) {
+	var curves *utls.SupportedCurvesExtension
+	var shares *utls.KeyShareExtension
+	for _, extension := range uConn.Extensions {
+		switch ext := extension.(type) {
+		case *utls.SupportedCurvesExtension:
+			curves = ext
+		case *utls.KeyShareExtension:
+			shares = ext
+		}
+	}
+	if curves == nil || shares == nil || !common.Contains(curves.Curves, utls.X25519) {
+		return false, E.New("randomized REALITY hello has no X25519 group")
+	}
+	nextCurves, _ := placeCurveBefore(curves.Curves, utls.X25519MLKEM768, utls.X25519)
+	curves.Curves = nextCurves
+	kept := make([]utls.KeyShare, 0, 3)
+	var x25519 *utls.KeyShare
+	var mlkem *utls.KeyShare
+	for _, share := range shares.KeyShares {
+		switch {
+		case realityIsGREASE(uint16(share.Group)):
+			kept = append(kept, share)
+		case share.Group == utls.X25519:
+			cp := share
+			x25519 = &cp
+		case share.Group == utls.X25519MLKEM768:
+			cp := share
+			mlkem = &cp
+		}
+	}
+	if x25519 == nil {
+		return false, E.New("randomized REALITY hello has no X25519 key share")
+	}
+	needKey := mlkem == nil || len(mlkem.Data) != utlsmlkem.EncapsulationKeySize768+32
+	if mlkem != nil && !needKey {
+		kept = append(kept, *mlkem)
+	} else {
+		kept = append(kept, utls.KeyShare{Group: utls.X25519MLKEM768})
+	}
+	kept = append(kept, *x25519)
+	shares.KeyShares = kept
+	return needKey, nil
+}
+
+func clearNonGREASEKeyShareData(uConn *utls.UConn) {
+	for _, extension := range uConn.Extensions {
+		shares, ok := extension.(*utls.KeyShareExtension)
+		if !ok {
+			continue
+		}
+		for i := range shares.KeyShares {
+			if realityIsGREASE(uint16(shares.KeyShares[i].Group)) {
+				continue
+			}
+			shares.KeyShares[i].Data = nil
+		}
+	}
+}
+
+func realityIsGREASE(v uint16) bool {
+	return v>>8 == v&0xff && v&0xf == 0xa
 }
 
 func specHasX25519Anchor(spec *utls.ClientHelloSpec) bool {

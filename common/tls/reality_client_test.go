@@ -11,9 +11,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/sagernet/sing-box/option"
@@ -115,7 +117,170 @@ func TestRealityClientHelloRandomizedAlwaysOffersMLKEM(t *testing.T) {
 		config.uClient.id.Seed = seed
 		message, hello := readRealityClientHello(t, config)
 		assertRealitySession(t, serverKey, message, hello)
+		assertRandomizedBrowserKeyShares(t, hello)
 	}
+}
+
+func TestRealityRandomizedNoExtraKeyShare(t *testing.T) {
+	t.Parallel()
+	config, _ := newRealityHelloClient(t, "randomized")
+	for range 1000 {
+		seed, err := utls.NewPRNGSeed()
+		require.NoError(t, err)
+		config.uClient.id.Seed = seed
+		_, hello := readRealityClientHello(t, config)
+		assertRandomizedBrowserKeyShares(t, hello)
+	}
+}
+
+func TestRealityRandomizedDistributionMatchesUTLS(t *testing.T) {
+	t.Parallel()
+	config, _ := newRealityHelloClient(t, "randomized")
+	baseExt := map[string]int{}
+	realExt := map[string]int{}
+	baseCipher := map[string]int{}
+	realCipher := map[string]int{}
+	rawP256Shares := 0
+	for range 200 {
+		seed, err := utls.NewPRNGSeed()
+		require.NoError(t, err)
+		config.uClient.id.Seed = seed
+		base := buildRawRandomizedHello(t, config)
+		client, server := net.Pipe()
+		real, err := buildRandomizedRealityConn(client, config.uClient.config.Clone(), config.uClient.id)
+		_ = server.Close()
+		_ = client.Close()
+		require.NoError(t, err)
+		require.Equal(t, base.HandshakeState.Hello.CipherSuites, real.HandshakeState.Hello.CipherSuites)
+		require.Equal(t, extensionTypes(base), extensionTypes(real))
+		require.Equal(t, curvesWithoutMLKEM(realityCurves(base)), curvesWithoutMLKEM(realityCurves(real)))
+		require.Equal(t, alpnOf(base), alpnOf(real))
+		if sharesContain(base, utls.CurveP256) {
+			rawP256Shares++
+		}
+		baseExt[extensionTypes(base)]++
+		realExt[extensionTypes(real)]++
+		baseCipher[fmtUint16s(base.HandshakeState.Hello.CipherSuites)]++
+		realCipher[fmtUint16s(real.HandshakeState.Hello.CipherSuites)]++
+	}
+	require.Greater(t, len(baseExt), 8, "extension order should vary")
+	require.Equal(t, baseExt, realExt)
+	require.Greater(t, len(baseCipher), 20, "cipher suites should vary")
+	require.Equal(t, baseCipher, realCipher)
+	// The untouched uTLS draw still emits a P256 key share sometimes.
+	// Forcing the shared weight to 0 or 1 would make this 0 or 200.
+	require.Greater(t, rawP256Shares, 20)
+	require.Less(t, rawP256Shares, 180)
+}
+
+func sharesContain(uConn *utls.UConn, group utls.CurveID) bool {
+	for _, extension := range uConn.Extensions {
+		shares, ok := extension.(*utls.KeyShareExtension)
+		if !ok {
+			continue
+		}
+		for _, share := range shares.KeyShares {
+			if share.Group == group {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func TestRealityFixedFingerprintKeyShareShapes(t *testing.T) {
+	t.Parallel()
+	expects := map[string][]utls.CurveID{
+		// HelloChrome_133 already matches Chrome 131+.
+		"chrome": {utls.X25519MLKEM768, utls.X25519},
+		// HelloFirefox_120 sends X25519 and secp256r1. MLKEM is inserted in front.
+		"firefox": {utls.X25519MLKEM768, utls.X25519, utls.CurveP256},
+		// These templates send GREASE + X25519 only. MLKEM is inserted after GREASE.
+		"safari": {utls.X25519MLKEM768, utls.X25519},
+		"ios":    {utls.X25519MLKEM768, utls.X25519},
+		"edge":   {utls.X25519MLKEM768, utls.X25519},
+		"qq":     {utls.X25519MLKEM768, utls.X25519},
+	}
+	for fingerprint, want := range expects {
+		t.Run(fingerprint, func(t *testing.T) {
+			t.Parallel()
+			config, _ := newRealityHelloClient(t, fingerprint)
+			_, hello := readRealityClientHello(t, config)
+			got := nonGREASEShareGroups(hello)
+			require.Equal(t, want, got)
+		})
+	}
+}
+
+func assertRandomizedBrowserKeyShares(t *testing.T, hello *utls.PubClientHelloMsg) {
+	t.Helper()
+	groups := make([]utls.CurveID, 0, len(hello.KeyShares))
+	for _, share := range hello.KeyShares {
+		require.NotEqual(t, utls.CurveP256, share.Group, "randomized key_share must not include P256")
+		require.NotEqual(t, utls.CurveP384, share.Group)
+		require.NotEqual(t, utls.CurveP521, share.Group)
+		groups = append(groups, share.Group)
+	}
+	require.Equal(t, []utls.CurveID{utls.X25519MLKEM768, utls.X25519}, groups)
+	require.Contains(t, hello.SupportedCurves, utls.CurveP256)
+}
+
+func buildRawRandomizedHello(t *testing.T, config *RealityClientConfig) *utls.UConn {
+	t.Helper()
+	client, server := net.Pipe()
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+	uConn := utls.UClient(client, config.uClient.config.Clone(), config.uClient.id)
+	require.NoError(t, uConn.BuildHandshakeState())
+	return uConn
+}
+
+func curvesWithoutMLKEM(curves []utls.CurveID) []utls.CurveID {
+	out := make([]utls.CurveID, 0, len(curves))
+	for _, curve := range curves {
+		if curve != utls.X25519MLKEM768 {
+			out = append(out, curve)
+		}
+	}
+	return out
+}
+
+func extensionTypes(uConn *utls.UConn) string {
+	parts := make([]string, 0, len(uConn.Extensions))
+	for _, extension := range uConn.Extensions {
+		parts = append(parts, fmt.Sprintf("%T", extension))
+	}
+	return strings.Join(parts, ",")
+}
+
+func alpnOf(uConn *utls.UConn) []string {
+	for _, extension := range uConn.Extensions {
+		if alpn, ok := extension.(*utls.ALPNExtension); ok {
+			return alpn.AlpnProtocols
+		}
+	}
+	return nil
+}
+
+func nonGREASEShareGroups(hello *utls.PubClientHelloMsg) []utls.CurveID {
+	out := make([]utls.CurveID, 0, len(hello.KeyShares))
+	for _, share := range hello.KeyShares {
+		if share.Group&0xf == 0xa && share.Group>>8 == share.Group&0xff {
+			continue
+		}
+		out = append(out, share.Group)
+	}
+	return out
+}
+
+func fmtUint16s(values []uint16) string {
+	buf := make([]byte, 0, len(values)*4)
+	for _, value := range values {
+		buf = append(buf, byte(value), byte(value>>8), ',')
+	}
+	return string(buf)
 }
 
 // android and 360 have no X25519 key share and already fail on old Xray.
