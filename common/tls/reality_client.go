@@ -10,7 +10,6 @@ import (
 	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/tls"
@@ -37,7 +36,6 @@ import (
 	aTLS "github.com/sagernet/sing/common/tls"
 
 	utls "github.com/metacubex/utls"
-	utlsmlkem "github.com/metacubex/utls/mlkem"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/net/http2"
 )
@@ -218,11 +216,11 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 // aside from dropping an incomplete hybrid pair if one ever appears.
 func ensureRealityX25519MLKEM(uConn *utls.UConn) error {
 	if realityIsRandomized(uConn.ClientHelloID) {
+		// Weights and Seed are public. Forcing these two weights makes
+		// generateRandomizedSpec emit the hybrid group and its key share.
+		// uTLS then fills the private keys itself during BuildHandshakeState.
 		forceRandomizedMLKEM(&uConn.ClientHelloID)
-		if err := uConn.BuildHandshakeState(); err != nil {
-			return err
-		}
-		return patchBuiltMLKEMShare(uConn)
+		return uConn.BuildHandshakeState()
 	}
 	spec, err := utls.UTLSIdToSpec(uConn.ClientHelloID)
 	if err != nil || !specHasX25519Anchor(&spec) {
@@ -231,10 +229,14 @@ func ensureRealityX25519MLKEM(uConn *utls.UConn) error {
 		}
 		return stripUnpairedX25519MLKEM(uConn)
 	}
-	if insertMLKEMIntoSpec(&spec) {
-		// BuildHandshakeState reapplies the preset from this spec instead of
-		// the original fingerprint, so the inserted share is what gets keyed.
-		setUTLSClientHelloSpec(uConn, &spec)
+	if !insertMLKEMIntoSpec(&spec) {
+		return uConn.BuildHandshakeState()
+	}
+	// HelloCustom + ApplyPreset is the supported way to send a modified spec.
+	// ApplyPreset generates the X25519 and X25519MLKEM768 private keys.
+	uConn.ClientHelloID = utls.HelloCustom
+	if err := uConn.ApplyPreset(&spec); err != nil {
+		return err
 	}
 	return uConn.BuildHandshakeState()
 }
@@ -304,80 +306,6 @@ func insertMLKEMIntoSpec(spec *utls.ClientHelloSpec) bool {
 		shares.KeyShares = nextShares
 	}
 	return curvesChanged || sharesChanged
-}
-
-func patchBuiltMLKEMShare(uConn *utls.UConn) error {
-	var curves *utls.SupportedCurvesExtension
-	var shares *utls.KeyShareExtension
-	for _, extension := range uConn.Extensions {
-		switch ext := extension.(type) {
-		case *utls.SupportedCurvesExtension:
-			curves = ext
-		case *utls.KeyShareExtension:
-			shares = ext
-		}
-	}
-	if curves == nil || shares == nil ||
-		!common.Contains(curves.Curves, utls.X25519) ||
-		!common.Any(shares.KeyShares, func(share utls.KeyShare) bool {
-			return share.Group == utls.X25519
-		}) {
-		return stripUnpairedX25519MLKEM(uConn)
-	}
-	nextCurves, curvesChanged := placeCurveBefore(curves.Curves, utls.X25519MLKEM768, utls.X25519)
-	nextShares, sharesChanged := placeShareBefore(shares.KeyShares, utls.X25519MLKEM768, utls.X25519)
-	if !curvesChanged && !sharesChanged {
-		return nil
-	}
-	if curvesChanged {
-		curves.Curves = nextCurves
-	}
-	if sharesChanged {
-		shares.KeyShares = nextShares
-	}
-	if err := fillNewMLKEMShare(uConn, shares); err != nil {
-		return err
-	}
-	return uConn.BuildHandshakeState()
-}
-
-func fillNewMLKEMShare(uConn *utls.UConn, shares *utls.KeyShareExtension) error {
-	for i := range shares.KeyShares {
-		if shares.KeyShares[i].Group != utls.X25519MLKEM768 {
-			continue
-		}
-		if len(shares.KeyShares[i].Data) == utlsmlkem.EncapsulationKeySize768+32 {
-			return nil
-		}
-		dk, err := utlsmlkem.GenerateKey768()
-		if err != nil {
-			return err
-		}
-		ecdhe, err := ecdh.X25519().GenerateKey(rand.Reader)
-		if err != nil {
-			return err
-		}
-		shares.KeyShares[i].Data = append(dk.EncapsulationKey().Bytes(), ecdhe.PublicKey().Bytes()...)
-		keys := uConn.HandshakeState.State13.KeyShareKeys
-		if keys == nil {
-			return E.New("nil KeyShareKeys")
-		}
-		keys.MlkemEcdhe = ecdhe
-		assignMLKEMKey(keys, dk)
-		return nil
-	}
-	return nil
-}
-
-func setUTLSClientHelloSpec(uConn *utls.UConn, spec *utls.ClientHelloSpec) {
-	field := reflect.ValueOf(uConn).Elem().FieldByName("clientHelloSpec")
-	*(**utls.ClientHelloSpec)(unsafe.Pointer(field.UnsafeAddr())) = spec
-}
-
-func assignMLKEMKey(keys *utls.KeySharePrivateKeys, dk *utlsmlkem.DecapsulationKey768) {
-	src := reflect.ValueOf(dk).Elem().FieldByName("key")
-	dst := reflect.ValueOf(keys).Elem().FieldByName("Mlkem")
-	*(*unsafe.Pointer)(unsafe.Pointer(dst.UnsafeAddr())) = unsafe.Pointer(src.Pointer())
 }
 
 func stripUnpairedX25519MLKEM(uConn *utls.UConn) error {
