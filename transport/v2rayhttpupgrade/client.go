@@ -79,6 +79,11 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if err != nil && conn != nil {
+			conn.Close()
+		}
+	}()
 	if c.tlsConfig != nil {
 		conn, err = tls.ClientHandshake(ctx, conn, c.tlsConfig)
 		if err != nil {
@@ -108,7 +113,8 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 	if response.StatusCode != 101 ||
 		!strings.EqualFold(response.Header.Get("Connection"), "upgrade") ||
 		!strings.EqualFold(response.Header.Get("Upgrade"), "websocket") {
-		return nil, E.New("v2ray-http-upgrade: unexpected status: ", response.Status)
+		err = E.New("v2ray-http-upgrade: unexpected status: ", response.Status)
+		return nil, err
 	}
 	if bufReader.Buffered() > 0 {
 		buffer := buf.NewSize(bufReader.Buffered())
