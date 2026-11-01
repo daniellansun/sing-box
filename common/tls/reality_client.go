@@ -170,9 +170,14 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	}
 	binary.BigEndian.PutUint64(hello.SessionId, uint64(nowTime.Unix()))
 
-	hello.SessionId[0] = 1
-	hello.SessionId[1] = 8
-	hello.SessionId[2] = 1
+	// Xray-core since v26.7.11 defaults minClientVer to 26.3.27 when the
+	// field is unset (af7eb680). Xray's own client writes core.Version_*
+	// here; advertise that minimum so those servers accept the handshake.
+	// SessionId[3] is reserved and stays 0.
+	hello.SessionId[0] = 26
+	hello.SessionId[1] = 3
+	hello.SessionId[2] = 27
+	hello.SessionId[3] = 0
 	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
 	copy(hello.SessionId[8:], e.shortID[:])
 	if debug.Enabled {

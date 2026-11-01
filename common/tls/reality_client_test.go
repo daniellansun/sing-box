@@ -119,6 +119,7 @@ func TestRealityClientHelloChromeKeepsX25519MLKEM768(t *testing.T) {
 	clear(additional[39:71])
 	plaintext, err := aead.Open(nil, hello.Random[20:], hello.SessionId, additional)
 	require.NoError(t, err)
+	require.Equal(t, []byte{26, 3, 27, 0}, plaintext[:4])
 	require.Equal(t, []byte{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}, plaintext[8:16])
 }
 
